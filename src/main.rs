@@ -3,7 +3,6 @@
  * @author .ninju.
  * @version 0.0.0
  */
-
 /*
 Console Style Modifiers:
 1   - Bold
@@ -47,15 +46,15 @@ Console Style Modifiers:
 107 - Bright White background
 HEX - \x1b[38;2;R;G;Bm
 */
-
 use battery;
-use crossterm;
-use winreg::RegKey;
-use winreg::enums::*;
-use unicode_width::UnicodeWidthStr;
 use chrono::Duration;
-use num_cpus;
+use crossterm;
+use serde::Deserialize;
 use sysinfo;
+use unicode_width::UnicodeWidthStr;
+use winreg::enums::*;
+use winreg::RegKey;
+use wmi::{COMLibrary, WMIConnection};
 
 fn get_pc_name() -> String {
     std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Unknown".to_string())
@@ -67,7 +66,10 @@ fn get_username() -> String {
 fn get_battery_info() -> String {
     let manager = battery::Manager::new().unwrap();
     let mut info = String::new();
-
+    if manager.batteries().unwrap().count() == 0 {
+        return info;
+    }
+    info.push_str(format!("\x1b[1;38;2;255;153;221m{}\x1b[0m\n", subtitle("Battery")).as_str());
     for battery in manager.batteries().unwrap() {
         let battery = battery.unwrap();
         info.push_str(&format!(
@@ -77,7 +79,11 @@ fn get_battery_info() -> String {
                 format!(
                     "{:.1}%{}",
                     battery.state_of_charge().value * 100.0,
-                    if battery.state() == battery::State::Charging { " " } else { "" }
+                    if battery.state() == battery::State::Charging {
+                        " "
+                    } else {
+                        ""
+                    }
                 )
                 .as_str(),
                 50
@@ -85,11 +91,7 @@ fn get_battery_info() -> String {
         ));
         info.push_str(&format!(
             "\x1b[38;2;255;207;239m{}\x1b[0m\n",
-            flex_between(
-                "State:",
-                battery.state().to_string().as_str(),
-                50
-            )
+            flex_between("State:", battery.state().to_string().as_str(), 50)
         ));
         info.push_str(&format!(
             "\x1b[38;2;255;207;239m{}\x1b[0m\n",
@@ -109,11 +111,7 @@ fn get_battery_info() -> String {
         ));
         info.push_str(&format!(
             "\x1b[38;2;255;207;239m{}\x1b[0m\n",
-            flex_between(
-                "Voltage:",
-                &format!("{:.2}V", battery.voltage().value),
-                50
-            )
+            flex_between("Voltage:", &format!("{:.2}V", battery.voltage().value), 50)
         ));
         if let Some(time_to_full) = battery.time_to_full() {
             info.push_str(&format!(
@@ -131,7 +129,11 @@ fn get_battery_info() -> String {
                 "\x1b[38;2;255;207;239m{}\x1b[0m\n",
                 flex_between(
                     "Time to Empty:",
-                    &format!("{:02}:{:02}", duration.num_hours(), duration.num_minutes() % 60),
+                    &format!(
+                        "{:02}:{:02}",
+                        duration.num_hours(),
+                        duration.num_minutes() % 60
+                    ),
                     50
                 )
             ));
@@ -141,36 +143,71 @@ fn get_battery_info() -> String {
     info
 }
 
-fn get_processor_info() -> String {
-    let mut str = String::new();
-    let mut system = sysinfo::System::new_all();
-    system.refresh_all();
-    if let Some(cpu) = system.cpus().first() {
-        println!("{:?}", cpu);
-        str.push_str(&format!(
-            "\x1b[38;2;255;207;239m{}\x1b[0m\n",
-            flex_between("Model:", &cpu.brand().trim(), 50)
-        ));
-        str.push_str(&format!(
-            "\x1b[38;2;255;207;239m{}\x1b[0m\n",
-            flex_between("frequency:", &format!("{:.2}GHz", cpu.frequency() as f64 / 1000.0), 50)
-        ));
-        str.push_str(&format!(
-            "\x1b[38;2;255;207;239m{}\x1b[0m\n",
-            flex_between("Vendor:", &cpu.vendor_id().trim(), 50)
-        ));
-        str.push_str(&format!(
-            "\x1b[38;2;255;207;239m{}\x1b[0m\n",
-            flex_between("Usage:", &(cpu.cpu_usage().to_string() + "%"), 50)
-        ));
+fn get_processor_info() -> Result<String, Box<dyn std::error::Error>> {
+    let wmi_con = WMIConnection::new(COMLibrary::new()?.into())?;
+    let results: Vec<CpuInfo> = wmi_con.query()?;
+    let mut avg_cpu_usage = 0;
+    for result in results.iter().clone() {
+        if result.Name == "_Total" {
+            continue;
+        }
+        avg_cpu_usage += result.PercentProcessorTime;
     }
-    let num_cores = num_cpus::get();
+    avg_cpu_usage = avg_cpu_usage / (results.len() - 1) as u32;
+    let mut str = String::new();
+    let mut sys = sysinfo::System::new_all();
+    sys.refresh_all();
+    let cpu = sys.cpus().first().unwrap();
     str.push_str(&format!(
         "\x1b[38;2;255;207;239m{}\x1b[0m\n",
-        flex_between("Cores:", &num_cores.to_string(), 50)
+        flex_between(
+            "Model:",
+            &format!(
+                "{} @ {:.1}GHz",
+                cpu.brand().trim(),
+                cpu.frequency() as f64 / 1000.0
+            ),
+            50
+        )
     ));
-
-    str
+    str.push_str(&format!(
+        "\x1b[38;2;255;207;239m{}\x1b[0m\n",
+        flex_between("Usage:", &format!("{}%", avg_cpu_usage), 50)
+    ));
+    str.push_str(&format!(
+        "\x1b[38;2;255;207;239m{}\x1b[0m\n",
+        flex_between(
+            "Cores:",
+            &format!("{}", sys.physical_core_count().unwrap()),
+            50
+        )
+    ));
+    // other cpu info
+    str.push_str(&format!(
+        "\x1b[38;2;255;207;239m{}\x1b[0m\n",
+        flex_between("Threads:", &format!("{}", sys.cpus().len()), 50)
+    ));
+    str.push_str(&format!(
+        "\x1b[38;2;255;207;239m{}\x1b[0m\n",
+        flex_between("Vendor:", &format!("{}", cpu.vendor_id().trim()), 50)
+    ));
+    str.push_str(&format!(
+        "\x1b[38;2;255;207;239m{}\x1b[0m\n",
+        flex_between(
+            "Architecture:",
+            &format!(
+                "{}bit",
+                if std::env::consts::ARCH == "x86_64" {
+                    "64"
+                } else {
+                    "32"
+                }
+            ),
+            50
+        )
+    ));
+    str.push_str("\x1b[0m\n");
+    Ok(str)
 }
 
 fn get_console_width() -> u16 {
@@ -179,20 +216,27 @@ fn get_console_width() -> u16 {
 }
 fn get_os_version() -> String {
     let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
-    if let Ok(current_version) = hklm.open_subkey("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion") {
-        let product_name: String = current_version.get_value("ProductName").unwrap_or_else(|_| "Unknown".into());
-        let display_version: String = current_version.get_value("DisplayVersion").unwrap_or_else(|_| "Unknown".into());
+    if let Ok(current_version) = hklm.open_subkey("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion")
+    {
+        let product_name: String = current_version
+            .get_value("ProductName")
+            .unwrap_or_else(|_| "Unknown".into());
+        let display_version: String = current_version
+            .get_value("DisplayVersion")
+            .unwrap_or_else(|_| "Unknown".into());
         return format!("{} {}", product_name, display_version);
     }
     "Unknown".to_string()
 }
 fn format_header() -> String {
     let userstr: String = format!("{} {}@{}", "", get_username(), get_pc_name());
-/*     str.push_str(format!("\x1b[1;38;2;255;49;187m{}\x1b[0m", userstr).as_str());
+    /*     str.push_str(format!("\x1b[1;38;2;255;49;187m{}\x1b[0m", userstr).as_str());
     let current_len: u16 = UnicodeWidthStr::width(userstr.as_str()) as u16; */
     let os_version_str = get_os_version();
-    format!("\x1b[1;38;2;255;49;187m{}", flex_between(userstr.as_str(), os_version_str.as_str(), 50))
-    
+    format!(
+        "\x1b[1;38;2;255;49;187m{}",
+        flex_between(userstr.as_str(), os_version_str.as_str(), 50)
+    )
 }
 fn subtitle(string: &str) -> String {
     let width = get_console_width();
@@ -200,7 +244,14 @@ fn subtitle(string: &str) -> String {
     let start = (width - UnicodeWidthStr::width(string) as u16) / 2;
     for i in 0..width {
         if i >= start && i < start + UnicodeWidthStr::width(string) as u16 {
-            str.push_str(string.chars().nth((i - start) as usize).unwrap().to_string().as_str());
+            str.push_str(
+                string
+                    .chars()
+                    .nth((i - start) as usize)
+                    .unwrap()
+                    .to_string()
+                    .as_str(),
+            );
         } else {
             str.push_str(" ");
         }
@@ -220,7 +271,7 @@ fn gradient_delim(start_hex: u32, end_hex: u32, width_in_percent: u16) -> String
     let padding = (total_width - length) / 2;
     let mut str = String::new();
     for i in 0..total_width {
-        if i < padding || i >= padding + length {
+        if i < padding || i > padding + length {
             str.push_str(" ");
         } else {
             let t = (i - padding) as f32 / (length - 1) as f32;
@@ -238,33 +289,60 @@ fn flex_between(str1: &str, str2: &str, width_in_percent: u16 /* 1 - 100 */) -> 
         return "".to_string();
     }
     let console_width = get_console_width();
-    let side_padding = (console_width as f32 * (100.0 - width_in_percent as f32) / 100.0 / 2.0) as u16;
+    let side_padding =
+        (console_width as f32 * (100.0 - width_in_percent as f32) / 100.0 / 2.0) as u16;
     let mut str = String::new();
     for i in 0..console_width {
         if i < side_padding {
             str.push_str(" ");
         } else if i < side_padding + UnicodeWidthStr::width(str1) as u16 {
-            str.push_str(str1.chars().nth((i - side_padding) as usize).unwrap().to_string().as_str());
+            str.push_str(
+                str1.chars()
+                    .nth((i - side_padding) as usize)
+                    .unwrap()
+                    .to_string()
+                    .as_str(),
+            );
         } else if i < console_width - side_padding - UnicodeWidthStr::width(str2) as u16 {
             str.push_str(" ");
         } else if i < console_width - side_padding {
-            str.push_str(str2.chars().nth((i - (console_width - side_padding - UnicodeWidthStr::width(str2) as u16)) as usize).unwrap().to_string().as_str());
+            str.push_str(
+                str2.chars()
+                    .nth(
+                        (i - (console_width - side_padding - UnicodeWidthStr::width(str2) as u16))
+                            as usize,
+                    )
+                    .unwrap()
+                    .to_string()
+                    .as_str(),
+            );
         } else {
             str.push_str(" ");
         }
     }
     str
 }
-
+#[derive(Deserialize, Debug)]
+#[serde(rename = "Win32_PerfFormattedData_PerfOS_Processor")]
+#[serde(rename_all = "PascalCase")]
+struct CpuInfo {
+    PercentProcessorTime: u32,
+    Name: String,
+}
 fn main() {
     let mut str = String::new();
     // get pc
     str.push_str(format!("{}\n", format_header()).as_str());
     str.push_str((gradient_delim(0xffffff, 0xff31bb, 50) + "\n").as_str());
-    str.push_str(format!("\x1b[1;38;2;255;153;221m{}\x1b[0m\n", subtitle("Battery")).as_str());
     str.push_str(&get_battery_info());
     str.push_str("\n");
-    str.push_str(format!("\x1b[1;38;2;255;153;221m{}\x1b[0m\n", subtitle(format!("{} {}", "\u{f4bc}", "Processor").as_str())).as_str());
-    str.push_str(&get_processor_info());
+    str.push_str(
+        format!(
+            "\x1b[1;38;2;255;153;221m{}\x1b[0m\n",
+            subtitle(format!("{} {}", "\u{f4bc}", "Processor").as_str())
+        )
+        .as_str(),
+    );
+    str.push_str(&get_processor_info().unwrap());
     print!("{}", str);
 }
