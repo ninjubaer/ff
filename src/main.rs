@@ -49,12 +49,99 @@ HEX - \x1b[38;2;R;G;Bm
 use battery;
 use chrono::Duration;
 use crossterm;
-use serde::Deserialize;
 use sysinfo;
 use unicode_width::UnicodeWidthStr;
 use winreg::enums::*;
 use winreg::RegKey;
-use wmi::{COMLibrary, WMIConnection};
+use lazy_static::lazy_static;
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct FILETIME {
+    pub dwLowDateTime: u32,
+    pub dwHighDateTime: u32,
+}
+impl std::fmt::Debug for FILETIME {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.debug_struct("FILETIME")
+            .field("dwLowDateTime", &self.dwLowDateTime)
+            .field("dwHighDateTime", &self.dwHighDateTime)
+            .finish()
+    }
+}
+
+#[link(name = "Kernel32")]
+extern "system" {
+    fn GetSystemTimes(
+        lpIdleTime: *mut FILETIME,
+        lpKernelTime: *mut FILETIME,
+        lpUserTime: *mut FILETIME,
+    ) -> i32;
+}
+
+
+const CACHE_FILE: &str = "winget_cache.txt";
+const CACHE_DURATION: std::time::Duration = std::time::Duration::from_secs(3600); // 1 hour
+
+fn get_cached_winget_count() -> Option<usize> {
+    if let Ok(metadata) = std::fs::metadata(CACHE_FILE) {
+        if let Ok(modified) = metadata.modified() {
+            if let Ok(elapsed) = modified.elapsed() {
+                if elapsed < CACHE_DURATION {
+                    if let Ok(contents) = std::fs::read_to_string(CACHE_FILE) {
+                        return contents.trim().parse().ok();
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+pub struct FileTimes {
+    pub idle_time: FILETIME,
+    pub kernel_time: FILETIME,
+    pub user_time: FILETIME,
+}
+lazy_static! {
+    #[derive(Debug)]
+
+    pub static ref FILE_TIMES: FileTimes = {
+        let mut idle = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+        let mut kernel = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+        let mut user = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+        unsafe {
+            GetSystemTimes(&mut idle, &mut kernel, &mut user);
+        }
+        FileTimes {
+            idle_time: idle,
+            kernel_time: kernel,
+            user_time: user,
+        }
+    };
+}
+
+
+fn cache_winget_count(count: usize) {
+    let _ = std::fs::write(CACHE_FILE, count.to_string());
+}
+
+fn get_winget_count() -> usize {
+    if let Some(count) = get_cached_winget_count() {
+        return count;
+    }
+
+    let output = std::process::Command::new("winget")
+        .arg("list")
+        .output()
+        .ok()
+        .map(|output| String::from_utf8(output.stdout).unwrap_or_else(|_| "Unknown".to_string()))
+        .unwrap_or_else(|| "Unknown".to_string());
+
+    let count = output.lines().count() - 1; // Subtract 1 for the header line
+    cache_winget_count(count);
+    count
+}
 
 fn get_pc_name() -> String {
     std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Unknown".to_string())
@@ -63,13 +150,100 @@ fn get_username() -> String {
     std::env::var("USERNAME").unwrap_or_else(|_| "Unknown".to_string())
 }
 
+fn get_info() -> String {
+    let mut sys = sysinfo::System::new_all();
+    sys.refresh_all();
+    // uptime
+    let mut str = String::new();
+    let unix = sysinfo::System::boot_time();
+    let uptime = chrono::Utc::now().timestamp() - unix as i64;
+    str.push_str(&format!(
+        "\x1b[38;2;255;207;239m{}\x1b[0m\n",
+        flex_between(
+            "Uptime:",
+            &format!(
+                "{:02}:{:02}:{:02}",
+                uptime / 3600,
+                (uptime % 3600) / 60,
+                uptime % 60
+            ),
+            50
+        )
+    ));
+    let mut disks = sysinfo::Disks::new();
+    disks.refresh(false);
+    disks.iter().for_each(|disk| {
+        if disk.is_removable() {
+            return;
+        }
+        str.push_str(&format!(
+            "\x1b[38;2;255;207;239m{}\x1b[0m\n",
+            flex_between(
+                &format!(
+                    "Disk `{}` ({})",
+                    disk.name().to_str().unwrap_or("Unknown"),
+                    disk.mount_point().to_str().unwrap_or("Unknown")
+                ),
+                &format!(
+                    "{:.1} / {:.1} GB",
+                    (disk.total_space() - disk.available_space()) as f64 / 1024.0 / 1024.0 / 1024.0,
+                    disk.total_space() as f64 / 1024.0 / 1024.0 / 1024.0
+                ),
+                50
+            )
+        ));
+    });
+    str.push_str(&format!(
+        "\x1b[38;2;255;207;239m{}\x1b[0m\n",
+        flex_between("OS:", &format!("{}", get_os_version()), 50)
+    ));
+    let git_version = std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .ok()
+        .map(|output| String::from_utf8(output.stdout).unwrap_or_else(|_| "Unknown".to_string()))
+        .unwrap_or_else(|| "Unknown".to_string());
+    str.push_str(&format!(
+        "\x1b[38;2;255;207;239m{}\x1b[0m\n",
+        flex_between(
+            "Git Version:",
+            &format!("{}", git_version.replace("git version ", "").trim()),
+            50
+        )
+    ));
+    let winget_count = get_winget_count();
+    str.push_str(&format!(
+        "\x1b[38;2;255;207;239m{}\x1b[0m\n",
+        flex_between("Winget Packages:", &format!("{}", winget_count), 50)
+    ));
+
+    str.push_str(&format!(
+        "\x1b[38;2;255;207;239m{}\x1b[0m\n",
+        flex_between(
+            "Memory:",
+            &format!(
+                "{:.1} / {:.1} GB ({:.1}%)",
+                (sys.used_memory() as f64 / 1024.0 / 1024.0 / 1024.0) as f64,
+                (sys.total_memory() as f64 / 1024.0 / 1024.0 / 1024.0) as f64,
+                (sys.used_memory() as f64 / sys.total_memory() as f64) * 100.0
+            ),
+            50
+        )
+    ));
+
+    str
+}
+
 fn get_battery_info() -> String {
     let manager = battery::Manager::new().unwrap();
     let mut info = String::new();
     if manager.batteries().unwrap().count() == 0 {
         return info;
     }
-    info.push_str(format!("\x1b[1;38;2;255;153;221m{}\x1b[0m\n", subtitle("Battery")).as_str());
+    info.push_str(&format!(
+        "\x1b[1;38;2;255;153;221m{}\x1b[0m\n",
+        subtitle(&format!("{}  {}", "\u{f240}", "Battery"))
+    ));
     for battery in manager.batteries().unwrap() {
         let battery = battery.unwrap();
         info.push_str(&format!(
@@ -144,35 +318,46 @@ fn get_battery_info() -> String {
 }
 
 fn get_processor_info() -> Result<String, Box<dyn std::error::Error>> {
-    let wmi_con = WMIConnection::new(COMLibrary::new()?.into())?;
-    let results: Vec<CpuInfo> = wmi_con.query()?;
-    let mut avg_cpu_usage = 0;
-    for result in results.iter().clone() {
-        if result.Name == "_Total" {
-            continue;
-        }
-        avg_cpu_usage += result.PercentProcessorTime;
-    }
-    avg_cpu_usage = avg_cpu_usage / (results.len() - 1) as u32;
+    let start = std::time::Instant::now();
     let mut str = String::new();
     let mut sys = sysinfo::System::new_all();
     sys.refresh_all();
-    let cpu = sys.cpus().first().unwrap();
+    sys.refresh_cpu_usage();
+    let cpus = sys.cpus();
+    let cpu = cpus.first().unwrap();
     str.push_str(&format!(
         "\x1b[38;2;255;207;239m{}\x1b[0m\n",
-        flex_between(
-            "Model:",
-            &format!(
-                "{} @ {:.1}GHz",
-                cpu.brand().trim(),
-                cpu.frequency() as f64 / 1000.0
-            ),
-            50
-        )
+        flex_between("Model:", &format!("{}", cpu.brand().trim(),), 50)
     ));
     str.push_str(&format!(
         "\x1b[38;2;255;207;239m{}\x1b[0m\n",
-        flex_between("Usage:", &format!("{}%", avg_cpu_usage), 50)
+        flex_between(
+            "Speed:",
+            &format!("{:.2}GHz", cpu.frequency() as f64 / 1000.0),
+            50
+        )
+    ));
+    let mut idle = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+    let mut kernel = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+    let mut user = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+    unsafe {
+        GetSystemTimes(&mut idle, &mut kernel, &mut user);
+    }
+    let kernel_time = (kernel.dwHighDateTime as u64) << 32 | kernel.dwLowDateTime as u64;
+    let user_time = (user.dwHighDateTime as u64) << 32 | user.dwLowDateTime as u64;
+    let idle_time = (idle.dwHighDateTime as u64) << 32 | idle.dwLowDateTime as u64;
+    let total_time = kernel_time + user_time;
+    let total_time_diff = total_time - FILE_TIMES.kernel_time.dwHighDateTime as u64
+        - FILE_TIMES.kernel_time.dwLowDateTime as u64
+        + FILE_TIMES.user_time.dwHighDateTime as u64
+        + FILE_TIMES.user_time.dwLowDateTime as u64;
+    let idle_time_diff = idle_time - FILE_TIMES.idle_time.dwHighDateTime as u64
+        - FILE_TIMES.idle_time.dwLowDateTime as u64;
+    let cpu_usage = 100.0 * (total_time_diff - idle_time_diff) as f64 / total_time_diff as f64;
+    
+    str.push_str(&format!(
+        "\x1b[38;2;255;207;239m{}\x1b[0m\n",
+        flex_between("Usage:", &format!("{:.1}%", cpu_usage), 50)
     ));
     str.push_str(&format!(
         "\x1b[38;2;255;207;239m{}\x1b[0m\n",
@@ -210,6 +395,55 @@ fn get_processor_info() -> Result<String, Box<dyn std::error::Error>> {
     Ok(str)
 }
 
+fn get_disk_info() -> String {
+    let mut str = String::new();
+    let mut disks = sysinfo::Disks::new();
+    disks.refresh(false);
+    disks.iter().for_each(|disk| {
+        if disk.is_removable() {
+            return;
+        }
+        str.push_str(&format!(
+            "\x1b[38;2;255;207;239m{}\x1b[0m\n",
+            flex_between(
+                "Disk:",
+                &format!(
+                    "{} ({})",
+                    disk.name().to_str().unwrap_or("Unknown"),
+                    disk.mount_point().to_str().unwrap_or("Unknown")
+                ),
+                50
+            )
+        ));
+        str.push_str(&format!(
+            "\x1b[38;2;255;207;239m{}\x1b[0m\n",
+            flex_between(
+                "Usage:",
+                &format!(
+                    "{:.1} / {:.1} GB",
+                    (disk.total_space() - disk.available_space()) as f64 / 1024.0 / 1024.0 / 1024.0,
+                    disk.total_space() as f64 / 1024.0 / 1024.0 / 1024.0
+                ),
+                50
+            )
+        ));
+        str.push_str(&format!(
+            "\x1b[38;2;255;207;239m{}\x1b[0m\n",
+            flex_between(
+                "Type:",
+                &format!("{}", disk.file_system().to_str().unwrap_or("Unknown")),
+                50
+            )
+        ));
+        str.push_str(&format!(
+            "\x1b[38;2;255;207;239m{}\x1b[0m\n",
+            flex_between("Kind:", &format!("{}", disk.kind().to_string()), 50)
+        ));
+        str.push_str("\x1b[0m\n");
+    });
+    str
+}
+
 fn get_console_width() -> u16 {
     let (width, _) = crossterm::terminal::size().unwrap();
     width
@@ -224,7 +458,7 @@ fn get_os_version() -> String {
         let display_version: String = current_version
             .get_value("DisplayVersion")
             .unwrap_or_else(|_| "Unknown".into());
-        return format!("{} {}", product_name, display_version);
+        return format!("{} {}", product_name.trim(), display_version.trim());
     }
     "Unknown".to_string()
 }
@@ -234,7 +468,7 @@ fn format_header() -> String {
     let current_len: u16 = UnicodeWidthStr::width(userstr.as_str()) as u16; */
     let os_version_str = get_os_version();
     format!(
-        "\x1b[1;38;2;255;49;187m{}",
+        "\x1b[1;38;2;255;153;221m{}",
         flex_between(userstr.as_str(), os_version_str.as_str(), 50)
     )
 }
@@ -271,7 +505,7 @@ fn gradient_delim(start_hex: u32, end_hex: u32, width_in_percent: u16) -> String
     let padding = (total_width - length) / 2;
     let mut str = String::new();
     for i in 0..total_width {
-        if i < padding || i > padding + length {
+        if i < padding || i >= padding + length {
             str.push_str(" ");
         } else {
             let t = (i - padding) as f32 / (length - 1) as f32;
@@ -322,27 +556,28 @@ fn flex_between(str1: &str, str2: &str, width_in_percent: u16 /* 1 - 100 */) -> 
     }
     str
 }
-#[derive(Deserialize, Debug)]
-#[serde(rename = "Win32_PerfFormattedData_PerfOS_Processor")]
-#[serde(rename_all = "PascalCase")]
-struct CpuInfo {
-    PercentProcessorTime: u32,
-    Name: String,
-}
 fn main() {
+    // print all system times
     let mut str = String::new();
     // get pc
-    str.push_str(format!("{}\n", format_header()).as_str());
-    str.push_str((gradient_delim(0xffffff, 0xff31bb, 50) + "\n").as_str());
-    str.push_str(&get_battery_info());
+    str.push_str(&format!("{}\n", format_header()));
+    str.push_str(&(gradient_delim(0xffcbee, 0xff6bce, 50) + "\n"));
+    str.push_str(&format!(
+        "\x1b[1;38;2;255;153;221m{}\x1b[0m\n",
+        subtitle(&format!("{}  {}", "\u{f108}", "System"))
+    ));
+    str.push_str(&get_info());
     str.push_str("\n");
-    str.push_str(
-        format!(
-            "\x1b[1;38;2;255;153;221m{}\x1b[0m\n",
-            subtitle(format!("{} {}", "\u{f4bc}", "Processor").as_str())
-        )
-        .as_str(),
-    );
+    str.push_str(&get_battery_info());
+    str.push_str(&format!(
+        "\x1b[1;38;2;255;153;221m{}\x1b[0m\n",
+        subtitle(&format!("{}  {}", "\u{f4bc}", "Processor"))
+    ));
     str.push_str(&get_processor_info().unwrap());
+    str.push_str(&format!(
+        "\x1b[1;38;2;255;153;221m{}\x1b[0m\n",
+        subtitle(&format!("{}  {}", "\u{f0a0}", "Disks"))
+    ));
+    str.push_str(&get_disk_info());
     print!("{}", str);
 }
